@@ -75,7 +75,7 @@ void PosixEnv::Schedule(void (*function)(void*), void* arg) {
 }
 ```
 
-接着看下BGThread怎么执行任务的，不断循环从队列里取任务，如果为空则wait，队列里提取任务后，执行它。
+接着看下BGThread怎么执行任务的，不断循环从队列里取任务，如果为空则wait，	队列里提取任务后，执行它。
 
 ```cpp
 void PosixEnv::BGThread() {
@@ -160,3 +160,162 @@ static intptr_t MaxOpenFiles() {
 }
 ```
 
+创建新SequentialFile实例，封装了实例化方法，以便后续调整新实例化策略。以读的方式打开文件，并实例化PosixSequentialFile。
+
+```cpp
+  virtual Status NewSequentialFile(const std::string& fname,
+                                   SequentialFile** result) {
+    FILE* f = fopen(fname.c_str(), "r");
+    if (f == NULL) {
+      *result = NULL;
+      return IOError(fname, errno);
+    } else {
+      *result = new PosixSequentialFile(fname, f);
+      return Status::OK();
+    }
+  }
+```
+
+NewRandomAccessFile封装了实例化随机读文件类的方法，首先试着打开文件，如果打不开说明有问题，就不用继续了。接着尝试获取mmap的资格，如果获取到了，则以mmap的方式将该fd映射到内存，成功后实例化PosixMmapReadableFile；如果没有获取到则实例化PosixRandomAccessFile。
+
+封装的好处就是，可以根据策略实例化不同的子类。
+
+```cpp
+ virtual Status NewRandomAccessFile(const std::string& fname,
+                                     RandomAccessFile** result) {
+    *result = NULL;
+    Status s;
+    int fd = open(fname.c_str(), O_RDONLY);
+    if (fd < 0) {
+      s = IOError(fname, errno);
+    } else if (mmap_limit_.Acquire()) {
+      uint64_t size;
+      s = GetFileSize(fname, &size);
+      if (s.ok()) {
+        void* base = mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0);
+        if (base != MAP_FAILED) {
+          *result = new PosixMmapReadableFile(fname, base, size, &mmap_limit_);
+        } else {
+          s = IOError(fname, errno);
+        }
+      }
+      close(fd);
+      if (!s.ok()) {
+        mmap_limit_.Release();
+      }
+    } else {
+      *result = new PosixRandomAccessFile(fname, fd, &fd_limit_);
+    }
+    return s;
+ }
+```
+
+实例化写入文件类，以写的方式打开文件，并实例化PosixWritableFile实现
+
+```cpp
+ virtual Status NewWritableFile(const std::string& fname,
+                                 WritableFile** result) {
+    Status s;
+    FILE* f = fopen(fname.c_str(), "w");
+    if (f == NULL) {
+      *result = NULL;
+      s = IOError(fname, errno);
+    } else {
+      *result = new PosixWritableFile(fname, f);
+    }
+    return s;
+  }
+```
+
+实例化追加写文件类，跟writable的区别是以追加的方式打开文件。
+
+```cpp
+virtual Status NewAppendableFile(const std::string& fname,
+                                   WritableFile** result) {
+    Status s;
+    FILE* f = fopen(fname.c_str(), "a");
+    if (f == NULL) {
+      *result = NULL;
+      s = IOError(fname, errno);
+    } else {
+      *result = new PosixWritableFile(fname, f);
+    }
+    return s;
+  }
+```
+
+PosixLockTable提供的作用是相同进程如果已经锁定了file，则可以判断不能再次锁定。其通过set类重复insert相同值时，返回false来实现判断。而且由于用了互斥scoped锁，所以多进程也是可以的。
+
+```cpp
+// Set of locked files.  We keep a separate set instead of just
+// relying on fcntrl(F_SETLK) since fcntl(F_SETLK) does not provide
+// any protection against multiple uses from the same process.
+class PosixLockTable {
+ private:
+  port::Mutex mu_;
+  std::set<std::string> locked_files_;
+ public:
+  bool Insert(const std::string& fname) {
+    MutexLock l(&mu_);
+    return locked_files_.insert(fname).second;
+  }
+  void Remove(const std::string& fname) {
+    MutexLock l(&mu_);
+    locked_files_.erase(fname);
+  }
+};
+```
+
+我们接着看下对文件lock的操作。
+
+fcntl是对fd操作的一个系统调用。解释如下，可以理解为防止多个操作程序同时访问文件的某部分。
+
+> The remaining `fcntl` commands are used to support *record locking*, which permits multiple cooperating programs to prevent each other from simultaneously accessing parts of a file in error-prone ways.
+>
+> An *exclusive* or *write* lock gives a process exclusive access for writing to the specified part of the file. While a write lock is in place, no other process can lock that part of the file.
+>
+> A *shared* or *read* lock prohibits any other process from requesting a write lock on the specified part of the file. However, other processes can request read locks.
+
+```cpp
+static int LockOrUnlock(int fd, bool lock) {
+  errno = 0;
+  struct flock f;
+  memset(&f, 0, sizeof(f));
+  f.l_type = (lock ? F_WRLCK : F_UNLCK);
+  f.l_whence = SEEK_SET;
+  f.l_start = 0;
+  f.l_len = 0;        // Lock/unlock entire file
+  return fcntl(fd, F_SETLK, &f);
+}
+```
+
+LockFile提供了锁定某个文件的方法。具体方式为，通过多个if语句使整个异常判断实现简单；首先打开文件名所对应的fd，接着看是否已经在locks里【防止同一个进程对同一文件获取多次锁】，接着通过LockOrUnlock防止多个进程获取同一个锁，最后实例化FileLock子类PosixFileLock。
+
+```cpp
+  virtual Status LockFile(const std::string& fname, FileLock** lock) {
+    *lock = NULL;
+    Status result;
+    int fd = open(fname.c_str(), O_RDWR | O_CREAT, 0644);
+    if (fd < 0) {
+      result = IOError(fname, errno);
+    } else if (!locks_.Insert(fname)) {
+      close(fd);
+      result = Status::IOError("lock " + fname, "already held by process");
+    } else if (LockOrUnlock(fd, true) == -1) {
+      result = IOError("lock " + fname, errno);
+      close(fd);
+      locks_.Remove(fname);
+    } else {
+      PosixFileLock* my_lock = new PosixFileLock;
+      my_lock->fd_ = fd;
+      my_lock->name_ = fname;
+      *lock = my_lock;
+    }
+    return result;
+  }
+```
+
+## 技巧
+
+1. 通过多个if，使异常判断一气呵成。
+2. 通过将实例化父类的方法封装，从而可以通过不同策略，实例化不同子类。 封装的好处。
