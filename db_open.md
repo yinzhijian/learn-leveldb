@@ -1,6 +1,6 @@
 # DB Open流程
 
-Version：table文件的集合
+Version：table文件的集合。files中存在的文件必须在磁盘中实际存在
 
 VersionSet：维护所有的Version
 
@@ -121,10 +121,12 @@ tatus DBImpl::Recover(VersionEdit* edit, bool *save_manifest) {
     return s;
   }
   std::set<uint64_t> expected;
+  //通过遍历versionset的双向链表，从所有的version中获取files
   versions_->AddLiveFiles(&expected);
   uint64_t number;
   FileType type;
   std::vector<uint64_t> logs;
+  //校验是否有丢失的数据
   for (size_t i = 0; i < filenames.size(); i++) {
     if (ParseFileName(filenames[i], &number, &type)) {
       expected.erase(number);
@@ -337,7 +339,7 @@ builder实例化时，对versionSet的引用+1，初始化levels_的added_filles
   }
 ```
 
-builder的saveTo，将builder维护的信息存储到version中。
+builder的saveTo，将builder维护的信息存储到version中。按照smallest key顺序将base和added中的file添加进version的files中
 
 ```cpp
 void SaveTo(Version* v) {
@@ -355,16 +357,17 @@ void SaveTo(Version* v) {
            added_iter != added->end();
            ++added_iter) {
         // Add all smaller files listed in base_
+        //逻辑是added 和 base按照key大小顺序添加进version中
+        //最终效果如下
+        // base1 base2 added3 base4 added5 added6 base7
         for (std::vector<FileMetaData*>::const_iterator bpos
                  = std::upper_bound(base_iter, base_end, *added_iter, cmp);
              base_iter != bpos;
-             ++base_iter) {
+             ++base_iter) {//注意这里的base_iter++，也就是说每个added之前的只会添加一次。
           MaybeAddFile(v, level, *base_iter);
         }
-
         MaybeAddFile(v, level, *added_iter);
       }
-
       // Add remaining base files
       for (; base_iter != base_end; ++base_iter) {
         MaybeAddFile(v, level, *base_iter);
@@ -387,5 +390,290 @@ void SaveTo(Version* v) {
 #endif
     }
   }
+```
+
+MaybeAddFile添加FileMetaData进入version的files_[level]中，如果该文件已经删除则忽略，否则在level>0层该FileMetaData的smallest key不能小于已有的文件的largest key。【不能重复添加相同文件】
+
+```cpp
+  void MaybeAddFile(Version* v, int level, FileMetaData* f) {
+    if (levels_[level].deleted_files.count(f->number) > 0) {
+      // File is deleted: do nothing
+    } else {
+      std::vector<FileMetaData*>* files = &v->files_[level];
+      if (level > 0 && !files->empty()) {
+        // Must not overlap
+        assert(vset_->icmp_.Compare((*files)[files->size()-1]->largest,
+                                    f->smallest) < 0);
+      }
+      f->refs++;
+      files->push_back(f);
+    }
+  }
+```
+
+Finalize计算并设置下一个需要compaction的level，策略如下，level0上的得分等于文件数量除以4，level1-7的得分等于该level的文件总大小除以10mb^level，该层的文件大小超过该level最大期望大小越多，则越需要仅compact。
+
+```cpp
+void VersionSet::Finalize(Version* v) {
+  // Precomputed best level for next compaction
+  int best_level = -1;
+  double best_score = -1;
+
+  for (int level = 0; level < config::kNumLevels-1; level++) {
+    double score;
+    if (level == 0) {
+      // We treat level-0 specially by bounding the number of files
+      // instead of number of bytes for two reasons:
+      //
+      // (1) With larger write-buffer sizes, it is nice not to do too
+      // many level-0 compactions.
+      //
+      // (2) The files in level-0 are merged on every read and
+      // therefore we wish to avoid too many files when the individual
+      // file size is small (perhaps because of a small write-buffer
+      // setting, or very high compression ratios, or lots of
+      // overwrites/deletions).
+      score = v->files_[level].size() /
+          static_cast<double>(config::kL0_CompactionTrigger);
+    } else {
+      // Compute the ratio of current size to size limit.
+      const uint64_t level_bytes = TotalFileSize(v->files_[level]);
+      score =
+          static_cast<double>(level_bytes) / MaxBytesForLevel(options_, level);
+    }
+
+    if (score > best_score) {
+      best_level = level;
+      best_score = score;
+    }
+  }
+
+  v->compaction_level_ = best_level;
+  v->compaction_score_ = best_score;
+}
+```
+
+AppendVersion则是将version插入到versionSet的双向链表【链表环，从prev或next一直往下都可以遍历完】中，设置为当前version。dummy_version为最新，将version插入到dummy_version之前。dummy的prev是相对新的，next是老的。
+
+```cpp
+void VersionSet::AppendVersion(Version* v) {
+  // Make "v" current
+  assert(v->refs_ == 0);
+  assert(v != current_);
+  if (current_ != NULL) {
+    current_->Unref();
+  }
+  current_ = v;
+  v->Ref();
+
+  // Append to linked list
+  v->prev_ = dummy_versions_.prev_;
+  v->next_ = &dummy_versions_;
+  v->prev_->next_ = v;
+  v->next_->prev_ = v;
+}
+```
+
+ReuseManifest在manifest小于max_file_size且配置reuse_logs=true的情况下打开该manifest继续使用。
+
+```cpp
+bool VersionSet::ReuseManifest(const std::string& dscname,
+                               const std::string& dscbase) {
+  if (!options_->reuse_logs) {
+    return false;
+  }
+  FileType manifest_type;
+  uint64_t manifest_number;
+  uint64_t manifest_size;
+  if (!ParseFileName(dscbase, &manifest_number, &manifest_type) ||
+      manifest_type != kDescriptorFile ||
+      !env_->GetFileSize(dscname, &manifest_size).ok() ||
+      // Make new compacted MANIFEST if old one is too big
+      manifest_size >= TargetFileSize(options_)) {
+    return false;
+  }
+
+  assert(descriptor_file_ == NULL);
+  assert(descriptor_log_ == NULL);
+  Status r = env_->NewAppendableFile(dscname, &descriptor_file_);
+  if (!r.ok()) {
+    Log(options_->info_log, "Reuse MANIFEST: %s\n", r.ToString().c_str());
+    assert(descriptor_file_ == NULL);
+    return false;
+  }
+
+  Log(options_->info_log, "Reusing MANIFEST %s\n", dscname.c_str());
+  descriptor_log_ = new log::Writer(descriptor_file_, manifest_size);
+  manifest_file_number_ = manifest_number;
+  return true;
+}
+```
+
+RecoverLogFile从log中恢复memtable【通过WriteBatchInternal辅助类】，如果memtable的大小大于write_buffer_size则compact到level0，小于则在配置了reuse_log的情况下，设置到当前mem\_及log\_，否则还是compact到level0。
+
+```cpp
+Status DBImpl::RecoverLogFile(uint64_t log_number, bool last_log,
+                              bool* save_manifest, VersionEdit* edit,
+                              SequenceNumber* max_sequence) {
+  struct LogReporter : public log::Reader::Reporter {
+    Env* env;
+    Logger* info_log;
+    const char* fname;
+    Status* status;  // NULL if options_.paranoid_checks==false
+    virtual void Corruption(size_t bytes, const Status& s) {
+      Log(info_log, "%s%s: dropping %d bytes; %s",
+          (this->status == NULL ? "(ignoring error) " : ""),
+          fname, static_cast<int>(bytes), s.ToString().c_str());
+      if (this->status != NULL && this->status->ok()) *this->status = s;
+    }
+  };
+
+  mutex_.AssertHeld();
+
+  // Open the log file
+  std::string fname = LogFileName(dbname_, log_number);
+  SequentialFile* file;
+  Status status = env_->NewSequentialFile(fname, &file);
+  if (!status.ok()) {
+    MaybeIgnoreError(&status);
+    return status;
+    }
+
+  // Create the log reader.
+  LogReporter reporter;
+  reporter.env = env_;
+  reporter.info_log = options_.info_log;
+  reporter.fname = fname.c_str();
+  reporter.status = (options_.paranoid_checks ? &status : NULL);
+  // We intentionally make log::Reader do checksumming even if
+  // paranoid_checks==false so that corruptions cause entire commits
+  // to be skipped instead of propagating bad information (like overly
+  // large sequence numbers).
+  log::Reader reader(file, &reporter, true/*checksum*/,
+                     0/*initial_offset*/);
+  Log(options_.info_log, "Recovering log #%llu",
+      (unsigned long long) log_number);
+
+  // Read all the records and add to a memtable
+  std::string scratch;
+  Slice record;
+  WriteBatch batch;
+  int compactions = 0;
+  MemTable* mem = NULL;//如果没有有效记录也就不用初始化memtable，后面讲memtable 写入到ldb时判断简单
+  while (reader.ReadRecord(&record, &scratch) &&
+         status.ok()) {
+    if (record.size() < 12) {
+      reporter.Corruption(
+          record.size(), Status::Corruption("log record too small"));
+      continue;
+    }
+    WriteBatchInternal::SetContents(&batch, record);//将记录转换为WriteBatch，以便提供转录到memtable中
+    if (mem == NULL) {
+      mem = new MemTable(internal_comparator_);
+      mem->Ref();
+    }
+    status = WriteBatchInternal::InsertInto(&batch, mem);//通过iterator put到memtable
+    MaybeIgnoreError(&status);
+    if (!status.ok()) {
+      break;
+    }
+    const SequenceNumber last_seq =
+        WriteBatchInternal::Sequence(&batch) +
+      WriteBatchInternal::Count(&batch) - 1;//设置最新的seq为最后一个记录的seq
+    if (last_seq > *max_sequence) {
+      *max_sequence = last_seq;
+    }
+	//通过arena管理的大小估算memtable占用大小，write_buffer_size[默认4mb]
+    //Larger values increase performance, especially during bulk loads
+    if (mem->ApproximateMemoryUsage() > options_.write_buffer_size) {
+      compactions++;//当大于阈值时，说明需要compaction了
+      *save_manifest = true;
+      status = WriteLevel0Table(mem, edit, NULL);
+      mem->Unref();
+      mem = NULL;
+      if (!status.ok()) {
+        // Reflect errors immediately so that conditions like full
+        // file-systems cause the DB::Open() to fail.
+        break;
+      }
+    }
+  }
+  delete file;
+  // See if we should keep reusing the last log file.
+  if (status.ok() && options_.reuse_logs && last_log && compactions == 0) {
+    assert(logfile_ == NULL);
+    assert(log_ == NULL);
+    assert(mem_ == NULL);
+    uint64_t lfile_size;
+    if (env_->GetFileSize(fname, &lfile_size).ok() &&
+        env_->NewAppendableFile(fname, &logfile_).ok()) {
+      Log(options_.info_log, "Reusing old log %s \n", fname.c_str());
+      log_ = new log::Writer(logfile_, lfile_size);
+      logfile_number_ = log_number;
+      if (mem != NULL) {
+        mem_ = mem;
+        mem = NULL;
+      } else {
+        // mem can be NULL if lognum exists but was empty.
+        mem_ = new MemTable(internal_comparator_);
+        mem_->Ref();
+      }
+    }
+  }
+    if (mem != NULL) {
+    // mem did not get reused; compact it.
+    if (status.ok()) {
+      *save_manifest = true;
+      status = WriteLevel0Table(mem, edit, NULL);
+    }
+    mem->Unref();
+  }
+  return status;
+}
+```
+
+```cpp
+Status DBImpl::WriteLevel0Table(MemTable* mem, VersionEdit* edit,
+                                Version* base) {
+  mutex_.AssertHeld();
+  const uint64_t start_micros = env_->NowMicros();
+  FileMetaData meta;
+  meta.number = versions_->NewFileNumber();
+  pending_outputs_.insert(meta.number);
+  Iterator* iter = mem->NewIterator();
+  Log(options_.info_log, "Level-0 table #%llu: started",
+      (unsigned long long) meta.number);
+
+  Status s;
+  {
+    mutex_.Unlock();
+    s = BuildTable(dbname_, env_, options_, table_cache_, iter, &meta);
+    mutex_.Lock();
+  }
+
+  Log(options_.info_log, "Level-0 table #%llu: %lld bytes %s",
+      (unsigned long long) meta.number,
+      (unsigned long long) meta.file_size,
+      s.ToString().c_str());
+  delete iter;
+  pending_outputs_.erase(meta.number);
+  // Note that if file_size is zero, the file has been deleted and
+  // should not be added to the manifest.
+  int level = 0;
+  if (s.ok() && meta.file_size > 0) {
+    const Slice min_user_key = meta.smallest.user_key();
+    const Slice max_user_key = meta.largest.user_key();
+    if (base != NULL) {
+      level = base->PickLevelForMemTableOutput(min_user_key, max_user_key);
+    }
+    edit->AddFile(level, meta.number, meta.file_size,
+                  meta.smallest, meta.largest);
+  }
+  CompactionStats stats;
+  stats.micros = env_->NowMicros() - start_micros;
+  stats.bytes_written = meta.file_size;
+  stats_[level].Add(stats);
+  return s;
+}
 ```
 

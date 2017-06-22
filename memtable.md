@@ -99,6 +99,13 @@ class InternalKeyComparator : public Comparator {
 
 **为什么sequence number要倒序排列呢？**
 
+原因是相同的key，seq+type大的在前面，即新数据在前面，因此从小到大查找时，可以少遍历一些老数据。举个例子，已有数据如下所示：
+
+key:'Yintao' @ 13 : 0,value:
+key:'Yintao' @ 9 : 1,value:Hello Tao!
+
+此时我们要get key=Yintao seq=13 type=1，如果正向排序，则需要先遍历Yintao 9。反向排序则只要遍历到第一条即可。由于131比130小【seq+type倒序排】，因此FindEqualOrGreater返回的是逻辑上较大的数据130即key:'Yintao' @ 13 : 0,value:
+
 ```cpp
 InternalKeyComparator的compare策略是，userkey部分使用BytewiseComparator，从小到大正序排，而tag部分，即sequence+type为倒序。
 int InternalKeyComparator::Compare(const Slice& akey, const Slice& bkey) const {
